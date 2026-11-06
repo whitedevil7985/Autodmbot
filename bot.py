@@ -1,13 +1,16 @@
 import logging
 import os
 import sqlite3
+from contextlib import contextmanager
 
+import psycopg
 from telegram import Update
 from telegram.constants import ChatType
 from telegram.error import TelegramError
 from telegram.ext import Application, ChatJoinRequestHandler, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "autodm.sqlite3")
 
 logging.basicConfig(
@@ -17,31 +20,55 @@ logging.basicConfig(
 logger = logging.getLogger("autodmbot")
 
 
-def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS group_settings (
-            chat_id INTEGER PRIMARY KEY,
-            welcome_text TEXT NOT NULL,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    return conn
+def database_url():
+    """Normalize Heroku's legacy postgres:// URL and require TLS for hosted DBs."""
+    url = DATABASE_URL
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url and "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
+
+
+@contextmanager
+def db_connection():
+    """Open, commit/rollback, and close one PostgreSQL or local SQLite connection."""
+    conn = psycopg.connect(database_url()) if DATABASE_URL else sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def initialize_database():
+    with db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_settings (
+                chat_id BIGINT PRIMARY KEY,
+                welcome_text TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    logger.info("Database initialized (%s)", "PostgreSQL" if DATABASE_URL else "SQLite")
 
 
 def get_message(chat_id: int):
-    with connect() as conn:
+    placeholder = "%s" if DATABASE_URL else "?"
+    with db_connection() as conn:
         row = conn.execute(
-            "SELECT welcome_text FROM group_settings WHERE chat_id = ?", (chat_id,)
+            f"SELECT welcome_text FROM group_settings WHERE chat_id = {placeholder}",
+            (chat_id,),
         ).fetchone()
     return row[0] if row else None
 
 
 def save_message(chat_id: int, welcome_text: str):
-    with connect() as conn:
-        conn.execute("""
+    placeholder = "%s" if DATABASE_URL else "?"
+    with db_connection() as conn:
+        conn.execute(f"""
             INSERT INTO group_settings (chat_id, welcome_text, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            VALUES ({placeholder}, {placeholder}, CURRENT_TIMESTAMP)
             ON CONFLICT(chat_id) DO UPDATE SET
                 welcome_text = excluded.welcome_text,
                 updated_at = CURRENT_TIMESTAMP
@@ -49,9 +76,10 @@ def save_message(chat_id: int, welcome_text: str):
 
 
 def delete_message(chat_id: int):
-    with connect() as conn:
+    placeholder = "%s" if DATABASE_URL else "?"
+    with db_connection() as conn:
         cur = conn.execute(
-            "DELETE FROM group_settings WHERE chat_id = ?", (chat_id,)
+            f"DELETE FROM group_settings WHERE chat_id = {placeholder}", (chat_id,)
         )
         return cur.rowcount > 0
 
@@ -96,14 +124,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context):
         return
-    text = " ".join(context.args).strip()
-    if not text:
+    message_text = " ".join(context.args).strip()
+    if not message_text:
         await update.effective_message.reply_text(
             "Usage: /setmsg Welcome {first_name}! Aapki request {group} mein mil gayi hai.\n"
             "Placeholders: {first_name}, {username}, {group}"
         )
         return
-    save_message(update.effective_chat.id, text)
+    save_message(update.effective_chat.id, message_text)
     await update.effective_message.reply_text("✅ Join-request DM message save ho gaya.")
 
 
@@ -136,10 +164,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context):
         return
     configured = bool(get_message(update.effective_chat.id))
+    database = "PostgreSQL" if DATABASE_URL else "SQLite (local)"
     await update.effective_message.reply_text(
         "⚙️ AutoDM Status\n"
         f"Group: {update.effective_chat.title or update.effective_chat.id}\n"
-        f"Welcome DM: {'Set ✅' if configured else 'Not set ❌'}"
+        f"Welcome DM: {'Set ✅' if configured else 'Not set ❌'}\n"
+        f"Database: {database}"
     )
 
 
@@ -147,7 +177,11 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     request = update.chat_join_request
     if not request:
         return
-    template = get_message(request.chat.id)
+    try:
+        template = get_message(request.chat.id)
+    except Exception:
+        logger.exception("Database read failed for chat %s", request.chat.id)
+        return
     if not template:
         logger.info("No welcome message configured for chat %s", request.chat.id)
         return
@@ -157,7 +191,6 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         template, user.first_name or "there", user.username, request.chat.title or "the group"
     )
     try:
-        # Telegram grants temporary DM access through user_chat_id on this update.
         await context.bot.send_message(
             chat_id=request.user_chat_id, text=message, disable_web_page_preview=True
         )
@@ -169,7 +202,7 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is required.")
-    connect().close()
+    initialize_database()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setmsg", setmsg))
